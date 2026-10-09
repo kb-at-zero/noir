@@ -1,5 +1,6 @@
 require "json"
 require "yaml"
+require "./route_evidence"
 
 struct Endpoint
   include JSON::Serializable
@@ -229,6 +230,9 @@ struct Details
   property code_paths : Array(PathInfo) = [] of PathInfo
   property status_code : Int32?
   property technology : String?
+  @[JSON::Field(ignore_serialize: route_evidence.nil?)]
+  @[YAML::Field(ignore_serialize: route_evidence.nil?)]
+  property route_evidence : RouteEvidence? = nil
 
   # Every technology that produced this endpoint, sorted, deduplicated.
   #
@@ -276,6 +280,7 @@ struct Details
       copy.technology = technology
     end
     copy.technologies = @technologies.reject(&.empty?).uniq!.sort!
+    copy.route_evidence = @route_evidence.try(&.detached_copy)
     copy
   end
 

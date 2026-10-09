@@ -1,4 +1,6 @@
 require "../../engines/go_engine"
+require "../../../miniparsers/gin_mount_resolver"
+require "../../../miniparsers/apiserver_adapter"
 
 module Analyzer::Go
   class Gin < GoEngine
@@ -11,6 +13,37 @@ module Analyzer::Go
     EMPTY_BUILDER_PREFIXES = Hash(String, Set(String)).new
 
     def analyze
+      legacy = analyze_legacy.dup
+      sources = read_package_file_contents
+      modules = {} of String => String
+      collect_go_modules.each { |mod, dir| modules[dir] = mod }
+      hits = Noir::GinMountResolver.new(sources, modules, configured_root_groups).resolve
+      hits += Noir::ApiserverAdapter.new(sources, modules).resolve
+      replacements = Set(Tuple(String, Int32, String)).new
+      corrected = [] of Endpoint
+      hits.each do |hit|
+        Noir::TreeSitterGoRouteExtractor.fan_out_verbs(hit.route.verb).each do |verb|
+          next unless %w[GET POST PUT PATCH DELETE HEAD OPTIONS QUERY].includes?(verb)
+          key = {hit.file, hit.route.line + 1, verb}
+          replacements << key
+          previous = legacy.find do |ep|
+            ep.method == verb && ep.details.code_paths.any? { |cp| cp.path == hit.file && cp.line == hit.route.line + 1 }
+          end
+          details = previous ? previous.details.detached_copy : Details.new(PathInfo.new(hit.file, hit.route.line + 1))
+          details.route_evidence = hit.evidence
+          ep = Endpoint.new(hit.route.path, verb, previous ? previous.params : [] of Param, details)
+          previous.try(&.callees.each { |callee| ep.push_callee(callee) })
+          corrected << ep
+        end
+      end
+      legacy.each do |ep|
+        next if ep.details.code_paths.any? { |cp| replacements.includes?({cp.path, cp.line || 0, ep.method}) }
+        corrected << ep
+      end
+      @result = corrected
+    end
+
+    private def analyze_legacy
       # Source Analysis
       public_dirs = [] of (Hash(String, String))
       package_groups, file_contents = collect_package_groups_ts(import_marker: IMPORT_MARKER)
@@ -26,7 +59,9 @@ module Analyzer::Go
       # from a central function with a versioned group (`addUserRoutes(
       # router.Group("/v1"))`). The prefix lives at the call site, so it
       # must be grafted onto the helper's routes.
+      apply_configured_root_groups(file_contents, package_groups)
       builder_prefixes_by_dir = resolve_router_builder_prefixes(file_contents, package_groups)
+      method_prefixes = resolve_router_method_prefixes(file_contents, package_groups)
       framework_dirs = framework_package_dirs(file_contents, IMPORT_MARKER)
       parallel_analyze(get_files_by_extension(".go")) do |path|
         next if GoEngine.go_test_file?(base_relative_path(path))
@@ -58,13 +93,25 @@ module Analyzer::Go
         dir_builder_prefixes = builder_prefixes_by_dir[dir]? || EMPTY_BUILDER_PREFIXES
         expand_builders = [] of Tuple(String, Noir::TreeSitterGoRouteExtractor::RouterBuilder, Set(String))
         suppress_ranges = [] of Range(Int32, Int32)
+        reachable_only = option_flag?("gin_reachable_only")
         if content.includes?("*gin.RouterGroup")
           Noir::TreeSitterGoRouteExtractor.collect_router_group_builders(content).each do |fn, rb|
             pset = dir_builder_prefixes[fn]?
-            next if pset.nil? || pset.empty?
-            next if cross_file_groups.has_key?(rb.param)
-            suppress_ranges << (rb.start_row..rb.end_row)
-            expand_builders << {fn, rb, pset}
+            if pset && !pset.empty? && !cross_file_groups.has_key?(rb.param)
+              suppress_ranges << (rb.start_row..rb.end_row)
+              expand_builders << {fn, rb, pset}
+            elsif reachable_only && !cross_file_groups.has_key?(rb.param)
+              suppress_ranges << (rb.start_row..rb.end_row)
+            end
+          end
+          Noir::TreeSitterGoRouteExtractor.collect_router_group_methods(content).each do |fn, rb|
+            pset = method_prefixes[fn]?
+            if pset && !pset.empty?
+              suppress_ranges << (rb.start_row..rb.end_row)
+              expand_builders << {fn, rb, pset}
+            elsif reachable_only
+              suppress_ranges << (rb.start_row..rb.end_row)
+            end
           end
         end
 
@@ -134,7 +181,7 @@ module Analyzer::Go
               # endpoint instead of a non-HTTP "ANY" string they
               # can't ingest.
               Noir::TreeSitterGoRouteExtractor.fan_out_verbs(route.verb).each do |verb|
-                new_endpoint = Endpoint.new(route.path, verb, details)
+                new_endpoint = Endpoint.new(gin_route_path(route), verb, details)
                 if entries = callees_by_route[route.line]?
                   entries.each do |entry|
                     name, callee_path, callee_line = entry
@@ -164,7 +211,7 @@ module Analyzer::Go
             ).each do |route|
               rdetails = Details.new(PathInfo.new(path, route.line + 1))
               Noir::TreeSitterGoRouteExtractor.fan_out_verbs(route.verb).each do |verb|
-                ep = Endpoint.new(route.path, verb, rdetails)
+                ep = Endpoint.new(gin_route_path(route), verb, rdetails)
                 if entries = callees_by_route[route.line]?
                   entries.each do |entry|
                     name, callee_path, callee_line = entry
@@ -215,6 +262,14 @@ module Analyzer::Go
         if match
           target.params << Param.new(match[1], "", "cookie")
         end
+      end
+    end
+
+    private def gin_route_path(route : Noir::TreeSitterGoRouteExtractor::Route) : String
+      if route.raw_path.empty? && route.path != "/" && route.path.ends_with?('/')
+        route.path.rchop('/')
+      else
+        route.path
       end
     end
 
@@ -338,6 +393,81 @@ module Analyzer::Go
       end
 
       result
+    end
+
+    # An external server wrapper can return a pre-prefixed Gin group. Bind
+    # only explicitly configured accessor names, then replay Group calls in
+    # that package so children inherit the supplied root. Without a binding
+    # the scan keeps its existing relative paths; it never guesses one.
+    private def apply_configured_root_groups(file_contents : Hash(String, String),
+                                             package_groups : Hash(String, Hash(String, String)))
+      roots = configured_root_groups
+      return if roots.empty?
+      files_by_dir = Hash(String, Array(String)).new { |h, k| h[k] = [] of String }
+      file_contents.each_key { |path| files_by_dir[File.dirname(path)] << path }
+      files_by_dir.each do |dir, paths|
+        groups = (package_groups[dir]? || Hash(String, String).new).dup
+        paths.each do |path|
+          Noir::TreeSitterGoRouteExtractor.collect_accessor_group_bindings(file_contents[path], roots).each do |name, prefix|
+            groups[name] = prefix
+          end
+        end
+        next if groups.empty?
+        paths.size.times do
+          previous = groups.dup
+          paths.each do |path|
+            groups = Noir::TreeSitterGoRouteExtractor.extract_groups(file_contents[path], groups)
+          end
+          break if groups == previous
+        end
+        package_groups[dir] = groups
+      end
+    end
+
+    private def configured_root_groups : Hash(String, String)
+      groups = Hash(String, String).new
+      option_string_map("gin_root_groups").each do |accessor, prefix|
+        next unless accessor.matches?(/\A[A-Za-z_][A-Za-z_0-9]*\z/)
+        next unless prefix.starts_with?('/') && !prefix.starts_with?("//")
+        next if prefix.matches?(/[\x00-\x1f\\?#]/)
+        groups[accessor] = prefix
+      end
+      groups
+    end
+
+    # Collect the concrete group passed to method registrations, including
+    # calls from a different Go package (`h.RegisterRoutes(apiRoute)`). The
+    # method bodies are expanded at that prefix in the per-file pass.
+    private def resolve_router_method_prefixes(file_contents : Hash(String, String),
+                                               package_groups : Hash(String, Hash(String, String))) : Hash(String, Set(String))
+      methods = Set(String).new
+      file_contents.each_value do |content|
+        next unless content.includes?("*gin.RouterGroup")
+        Noir::TreeSitterGoRouteExtractor.collect_router_group_methods(content).each_key { |name| methods << name }
+      end
+      prefixes = Hash(String, Set(String)).new { |h, k| h[k] = Set(String).new }
+      return prefixes if methods.empty?
+      file_contents.each do |path, content|
+        groups = package_groups[File.dirname(path)]? || Hash(String, String).new
+        Noir::TreeSitterGoRouteExtractor.collect_router_builder_callsites(content, methods).each do |name, argument|
+          if prefix = groups[argument]?
+            prefixes[name] << prefix
+          end
+        end
+      end
+      delegations = file_contents.values.flat_map do |content|
+        Noir::TreeSitterGoRouteExtractor.collect_router_method_delegations(content, methods)
+      end
+      loop do
+        changed = false
+        delegations.each do |outer, inner|
+          prefixes[outer].each do |prefix|
+            changed = true if prefixes[inner].add?(prefix)
+          end
+        end
+        break unless changed
+      end
+      prefixes
     end
 
     def get_param(line : String) : Param

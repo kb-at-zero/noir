@@ -509,6 +509,9 @@ class EndpointOptimizer
   end
 
   private def endpoint_source_scope(endpoint : Endpoint, cross_tech_keys : Set(Tuple(String, String))) : String
+    if evidence = endpoint.details.route_evidence
+      return evidence.scope unless evidence.entrypoint.empty?
+    end
     return "" if cross_tech_keys.includes?({endpoint.method, endpoint.url})
     framework_source_scope(endpoint)
   end

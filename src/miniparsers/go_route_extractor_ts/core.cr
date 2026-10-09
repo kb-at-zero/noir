@@ -317,6 +317,98 @@ module Noir
       result
     end
 
+    # Method registrations such as `func (h *Handler) RegisterRoutes(rg
+    # *gin.RouterGroup)` live in imported packages, not alongside their
+    # call sites. Keep them separate from function builders so the caller
+    # can bind their group parameter through a cross-package call edge.
+    def collect_router_group_methods(source : String) : Hash(String, RouterBuilder)
+      result = Hash(String, RouterBuilder).new
+      Noir::TreeSitter.parse_go(source) do |root|
+        Noir::TreeSitter.walk(root) do |node|
+          next unless Noir::TreeSitter.node_type(node) == "method_declaration"
+          name_node = Noir::TreeSitter.field(node, "name")
+          params = Noir::TreeSitter.field(node, "parameters")
+          next unless name_node && params
+          param = router_group_param_name(params, source)
+          next unless param
+          result[Noir::TreeSitter.node_text(name_node, source)] =
+            RouterBuilder.new(param, Noir::TreeSitter.node_start_row(node), Noir::TreeSitter.node_end_row(node))
+        end
+      end
+      result
+    end
+
+    # `RegisterRoutes(rg)` commonly delegates to a private
+    # `registerRoutes(rg)` method. Return outer→inner edges when the same
+    # RouterGroup parameter is forwarded unchanged, so call-site prefixes
+    # can flow through that extra layer without treating arbitrary method
+    # calls as route registrations.
+    def collect_router_method_delegations(source : String, methods : Set(String)) : Array(Tuple(String, String))
+      edges = [] of Tuple(String, String)
+      return edges if methods.empty?
+      Noir::TreeSitter.parse_go(source) do |root|
+        Noir::TreeSitter.walk(root) do |node|
+          next unless Noir::TreeSitter.node_type(node) == "method_declaration"
+          name_node = Noir::TreeSitter.field(node, "name")
+          params = Noir::TreeSitter.field(node, "parameters")
+          body = Noir::TreeSitter.field(node, "body")
+          next unless name_node && params && body
+          outer = Noir::TreeSitter.node_text(name_node, source)
+          next unless methods.includes?(outer)
+          param = router_group_param_name(params, source)
+          next unless param
+
+          Noir::TreeSitter.walk(body) do |call|
+            next unless Noir::TreeSitter.node_type(call) == "call_expression"
+            fn = Noir::TreeSitter.field(call, "function")
+            args = Noir::TreeSitter.field(call, "arguments")
+            next unless fn && args
+            next unless Noir::TreeSitter.node_type(fn) == "selector_expression"
+            field = Noir::TreeSitter.field(fn, "field")
+            next unless field
+            inner = Noir::TreeSitter.node_text(field, source)
+            next unless methods.includes?(inner)
+            first_arg = nil
+            Noir::TreeSitter.each_named_child(args) { |arg| first_arg ||= arg }
+            next unless first_arg && Noir::TreeSitter.node_type(first_arg) == "identifier"
+            next unless Noir::TreeSitter.node_text(first_arg, source) == param
+            edges << {outer, inner}
+          end
+        end
+      end
+      edges.uniq
+    end
+
+    # `<name> := value.GetAPIRouteGroup()` binds a router group whose root
+    # is supplied by an external library. The mapping is caller-provided;
+    # Noir never invents a prefix absent from source or configuration.
+    def collect_accessor_group_bindings(source : String, accessors : Hash(String, String)) : Hash(String, String)
+      result = Hash(String, String).new
+      return result if accessors.empty?
+      Noir::TreeSitter.parse_go(source) do |root|
+        Noir::TreeSitter.walk(root) do |node|
+          next unless group_assignment_node?(node)
+          left = Noir::TreeSitter.field(node, "left")
+          right = Noir::TreeSitter.field(node, "right")
+          next unless left && right
+          name_node = identifier_or_first_child(left)
+          call = Noir::TreeSitter.first_named_child(right)
+          next unless name_node && call
+          next unless Noir::TreeSitter.node_type(name_node) == "identifier"
+          next unless Noir::TreeSitter.node_type(call) == "call_expression"
+          fn = Noir::TreeSitter.field(call, "function")
+          next unless fn && Noir::TreeSitter.node_type(fn) == "selector_expression"
+          field = Noir::TreeSitter.field(fn, "field")
+          next unless field
+          accessor = Noir::TreeSitter.node_text(field, source)
+          if prefix = accessors[accessor]?
+            result[Noir::TreeSitter.node_text(name_node, source)] = prefix
+          end
+        end
+      end
+      result
+    end
+
     # Returns the sole `*gin.RouterGroup` parameter's name, or nil when
     # the function has zero or more than one such parameter.
     private def router_group_param_name(params : LibTreeSitter::TSNode, source : String) : String?
@@ -423,7 +515,7 @@ module Noir
     end
 
     private def find_function_body_node(node : LibTreeSitter::TSNode, source : String, name : String, &block : LibTreeSitter::TSNode ->)
-      if Noir::TreeSitter.node_type(node) == "function_declaration"
+      if {"function_declaration", "method_declaration"}.includes?(Noir::TreeSitter.node_type(node))
         if (nn = Noir::TreeSitter.field(node, "name")) && Noir::TreeSitter.node_text(nn, source) == name
           if body = Noir::TreeSitter.field(node, "body")
             yield body

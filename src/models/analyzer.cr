@@ -199,6 +199,21 @@ class Analyzer
     any_to_bool(@raw_options[key]?)
   end
 
+  # String-to-string analyzer configuration such as framework accessors and
+  # their externally supplied mount prefixes. Invalid shapes are ignored so
+  # a malformed optional framework section cannot abort unrelated analyzers.
+  protected def option_string_map(key : String) : Hash(String, String)
+    result = Hash(String, String).new
+    raw = @raw_options[key]?
+    return result unless raw
+    begin
+      raw.as_h.each { |map_key, value| result[map_key.to_s] = value.to_s }
+    rescue TypeCastError
+      return result
+    end
+    result
+  end
+
   # Worker-fiber count for this analyzer's file walk.
   #
   # Nil-safe and floored at 1, matching the shape `src/models/deliver.cr`

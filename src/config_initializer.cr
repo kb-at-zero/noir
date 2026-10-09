@@ -293,6 +293,8 @@ class ConfigInitializer
       "exclude_path"                 => YAML::Any.new(""),
       "exclude_techs"                => YAML::Any.new(""),
       "only_techs"                   => YAML::Any.new(""),
+      "gin_root_groups"              => YAML::Any.new({} of YAML::Any => YAML::Any),
+      "gin_reachable_only"           => YAML::Any.new(false),
       "format"                       => YAML::Any.new("plain"),
       "include_path"                 => YAML::Any.new(false),
       "include_techs"                => YAML::Any.new(false),
@@ -379,6 +381,14 @@ class ConfigInitializer
 
       # Technologies to exclude
       exclude_techs: "#{options["exclude_techs"]}"
+
+      # External Gin router-group accessors and their known root prefixes.
+      # Example: { GetAPIRouteGroup: "/api" }. Empty means no assumptions.
+      gin_root_groups: {}
+
+      # Exclude Gin RouterGroup registration helpers with no source-visible
+      # call site. Enable only when the scanned checkout contains startup code.
+      gin_reachable_only: #{options["gin_reachable_only"]}
 
       # Restrict detection to these technologies only (comma-separated;
       # empty = detect everything). The inverse of exclude_techs.

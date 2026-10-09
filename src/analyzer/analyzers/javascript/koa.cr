@@ -3,6 +3,7 @@ require "../../../miniparsers/js_route_extractor"
 require "../../../miniparsers/import_graph"
 require "../../../models/code_locator"
 require "../../../utils/url_path"
+require "../../../miniparsers/koa_middleware_route_extractor"
 
 module Analyzer::Javascript
   class Koa < JavascriptEngine
@@ -52,6 +53,14 @@ module Analyzer::Javascript
         # parks ~38 such routes per plugin that the shared
         # JSRouteExtractor would otherwise miss.
         extract_strapi_routes(path, content, result)
+
+        if content.includes?("pathToRegexp")
+          root = configured_base_for(path)
+          configs = get_files_by_relative_path("config/default.js", root)
+          configs.concat(get_files_by_relative_path("config/production.js", root))
+          config_sources = configs.map { |file| read_file_content(file) }
+          result.concat(Noir::KoaMiddlewareRouteExtractor.extract(content, path, config_sources))
+        end
       rescue e
         logger.debug "Parser failed for #{path}: #{e.message}, falling back to regex"
         analyze_with_regex(path, result, static_dirs)

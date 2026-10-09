@@ -41,3 +41,8 @@ FunctionalTester.new("fixtures/javascript/koa/", {
   :techs     => 1,
   :endpoints => expected_endpoints.size,
 }, expected_endpoints).perform_tests
+
+FunctionalTester.new("fixtures/javascript/koa_middleware_path/", {
+  :techs     => 1,
+  :endpoints => 1,
+}, [Endpoint.new("/api/v1/whoami", "GET")]).perform_tests

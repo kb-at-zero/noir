@@ -28,6 +28,7 @@ module Noir
     @position : Int32 = 0
     @framework : Symbol = :unknown
     @constants : Hash(String, String) = {} of String => String
+    @object_constants : Hash(String, Hash(String, String)) = {} of String => Hash(String, String)
     @current_route_path : String? = nil
     @current_route_paths : Array(String)? = nil # For multi-prefix support in route chains
     @current_route_start_idx : Int32? = nil
@@ -1379,8 +1380,45 @@ module Noir
           var_value = @tokens[idx + 3].value
           @constants[var_name] = var_value
         end
+        # Object constants: const ROUTE = { public: '/v4/couriers', ... }.
+        # Keys may be quoted or bare; values must be string literals.
+        if (@tokens[idx].value == "const" || @tokens[idx].value == "let" || @tokens[idx].value == "var") &&
+           idx + 4 < @tokens.size &&
+           @tokens[idx + 1].type == :identifier &&
+           (@tokens[idx + 2].type == :assign || @tokens[idx + 2].value == "=") &&
+           @tokens[idx + 3].type == :lbrace
+          obj_name = @tokens[idx + 1].value
+          members = extract_object_string_members(idx + 3)
+          @object_constants[obj_name] = members unless members.empty?
+        end
         idx += 1
       end
+    end
+
+    # Collects `key: 'value'` pairs from the object literal starting at
+    # `start_idx` (the token at/after `{`). Returns an empty hash when the
+    # token stream is not a plain object literal of string values.
+    private def extract_object_string_members(start_idx : Int32) : Hash(String, String)
+      members = {} of String => String
+      idx = start_idx
+      idx += 1 if idx < @tokens.size && @tokens[idx].type == :lbrace
+      # Bounded scan: object literals in route files are small; a runaway
+      # loop on minified content is capped hard.
+      limit = idx + 512
+      while idx < @tokens.size - 2 && idx < limit
+        break if @tokens[idx].type == :rbrace
+        key = @tokens[idx].value
+        quoted_key = @tokens[idx].type == :string
+        if (quoted_key || @tokens[idx].type == :identifier) &&
+           @tokens[idx + 1].type == :colon &&
+           @tokens[idx + 2].type == :string
+          members[key] = @tokens[idx + 2].value
+          idx += 3
+        else
+          idx += 1
+        end
+      end
+      members
     end
 
     # Resolve dynamic path construction (template literals and concatenation)
@@ -1406,6 +1444,24 @@ module Noir
       while idx < @tokens.size
         if @tokens[idx].type == :identifier
           var_name = @tokens[idx].value
+          # Member access on an object constant: ROUTE.public (+ optional
+          # continuation in the concatenation chain).
+          if idx + 2 < @tokens.size && @tokens[idx + 1].type == :dot &&
+             @tokens[idx + 2].type == :identifier
+            member = @tokens[idx + 2].value
+            if (obj = @object_constants[var_name]?) && (value = obj[member]?)
+              result += value
+            else
+              return nil # unresolved member — do not fabricate a path
+            end
+            idx += 3
+            if idx < @tokens.size && @tokens[idx].type == :plus
+              idx += 1
+              next
+            else
+              break
+            end
+          end
           if @constants.has_key?(var_name)
             result += @constants[var_name]
           else

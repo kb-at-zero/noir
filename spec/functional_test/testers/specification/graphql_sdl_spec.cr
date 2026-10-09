@@ -48,3 +48,11 @@ FunctionalTester.new("fixtures/specification/graphql_sdl/extend_federation/", {
     Param.new("quantity", "", "json"),
   ]),
 ]).perform_tests
+
+# A standalone schema follows the statically resolvable Apollo HTTP mount.
+FunctionalTester.new("fixtures/specification/graphql_sdl/apollo_config_mount/", {
+  :techs     => 1,
+  :endpoints => 1,
+}, [
+  Endpoint.new("/api/v1/graphql#Query.ping", "POST"),
+]).perform_tests

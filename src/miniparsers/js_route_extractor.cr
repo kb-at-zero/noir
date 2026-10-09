@@ -56,6 +56,10 @@ module Noir
         end
         parser = JSParser.new(content)
         route_patterns = parser.parse_routes
+        # A file may contain both an HTTP server and a RESTDataSource. Keep
+        # its server routes, but exclude calls on the client's `this` object.
+        outbound_positions = outbound_this_positions(content)
+        route_patterns.reject! { |pattern| outbound_positions.includes?(pattern.start_pos) }
 
         if debug && parser.hit_max_iterations?
           STDERR.puts "Warning: Maximum iterations reached in JS parser, parsing may be incomplete"
@@ -614,6 +618,54 @@ module Noir
       ".svelte\"", ".svelte'",
     ]
 
+    # A project-local subclass of Apollo RESTDataSource need not import the
+    # Apollo package itself. Its `this.get('/x')` calls are still outbound,
+    # and the generic verb parser must not turn them into server routes.
+    REST_DATA_SOURCE_SUBCLASS = /\bextends\s+(?:[A-Za-z_$][\w$]*\.)?[A-Za-z_$\w]*RESTDataSource[A-Za-z_$\w]*\b/
+
+    private def self.outbound_this_positions(content : String) : Set(Int32)
+      positions = Set(Int32).new
+      return positions unless content.includes?("extends")
+      client_types = Set{"RESTDataSource"}
+      content.scan(/\bRESTDataSource\s+as\s+([A-Za-z_$][\w$]*)/) { |match| client_types << match[1] }
+      Noir::TreeSitter.parse_javascript(content) do |root|
+        classes = [] of Tuple(String, String, LibTreeSitter::TSNode)
+        Noir::TreeSitter.walk(root) do |node|
+          next unless {"class_declaration", "class"}.includes?(Noir::TreeSitter.node_type(node))
+          name = Noir::TreeSitter.field(node, "name")
+          body = Noir::TreeSitter.field(node, "body")
+          next unless name && body
+          parent = ""
+          Noir::TreeSitter.each_named_child(node) do |child|
+            if Noir::TreeSitter.node_type(child) == "class_heritage"
+              parent = Noir::TreeSitter.node_text(child, content).sub(/\Aextends\s+/, "").strip
+            end
+          end
+          classes << {Noir::TreeSitter.node_text(name, content), parent, body}
+        end
+        classes.size.times do
+          classes.each do |name, parent, _|
+            if client_types.includes?(parent) || parent.matches?(/\A[A-Za-z_$\w.]*RESTDataSource[A-Za-z_$\w]*\z/)
+              client_types << name
+            end
+          end
+        end
+        classes.each do |name, _, body|
+          next unless client_types.includes?(name)
+          Noir::TreeSitter.walk(body) do |node|
+            next unless Noir::TreeSitter.node_type(node) == "call_expression"
+            fn = Noir::TreeSitter.field(node, "function")
+            next unless fn && Noir::TreeSitter.node_type(fn) == "member_expression"
+            object = Noir::TreeSitter.field(fn, "object")
+            next unless object && Noir::TreeSitter.node_text(object, content) == "this"
+            offset = LibTreeSitter.ts_node_start_byte(node).to_i
+            positions << content.byte_slice(0, offset).size
+          end
+        end
+      end
+      positions
+    end
+
     # Real HTTP-server library imports. When any of these is present
     # alongside a test-stub marker, the file is doing legitimate
     # server work (e.g., spinning up a test instance of an Express
@@ -786,7 +838,8 @@ module Noir
       return true if File.basename(file_path).matches?(TEST_STUB_FILENAME_MARKER)
       return true if relative_path.matches?(STRICT_TEST_PATH_MARKER)
       has_library = content_matches?(content, TEST_STUB_LIBRARY_MARKER) ||
-                    (include_client_frameworks && content_matches?(content, CLIENT_SIDE_FRAMEWORK_MARKER))
+                    (include_client_frameworks && content_matches?(content, CLIENT_SIDE_FRAMEWORK_MARKER)) ||
+                    content.matches?(REST_DATA_SOURCE_SUBCLASS)
       has_path_marker = relative_path.matches?(TEST_STUB_PATH_MARKER)
       return false unless has_library || has_path_marker
       !content_matches?(content, HTTP_SERVER_LIBRARY_MARKER)

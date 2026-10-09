@@ -779,6 +779,19 @@ describe Noir::JSRouteExtractor do
       ).should be_true
     end
 
+    it "skips project-local RESTDataSource subclasses without a direct Apollo import" do
+      content = <<-TS
+        import RESTDataSourceBasic from '../utils/RESTDataSourceBasic';
+        class ProductsAPI extends RESTDataSourceBasic {
+          products() { return this.get('/products'); }
+        }
+        TS
+      Noir::JSRouteExtractor.test_stub_only?(
+        "/repo/src/datasources/products.ts",
+        content
+      ).should be_true
+    end
+
     it "keeps a file importing both a data source lib and a real server lib" do
       # Precedence guard: the HTTP-server-import exemption wins, so a
       # file that imports @apollo/datasource-rest AND express is still
@@ -793,6 +806,26 @@ describe Noir::JSRouteExtractor do
         "/repo/src/server.ts",
         content
       ).should be_false
+    end
+
+    it "excludes only outbound receiver calls in a mixed server/data-source file" do
+      content = <<-JS
+        import express from 'express';
+        import { RESTDataSource as Base } from '@apollo/datasource-rest';
+        class API extends Base {
+          users() { return this.get('/outbound'); }
+        }
+        const app = express();
+        app.get('/inbound', (req, res) => res.json({}));
+        JS
+      path = File.tempname("noir-mixed-client", ".js")
+      begin
+        File.write(path, content)
+        routes = Noir::JSRouteExtractor.extract_routes(path, content)
+        routes.map(&.url).should eq(["/inbound"])
+      ensure
+        File.delete(path) if File.exists?(path)
+      end
     end
   end
 
