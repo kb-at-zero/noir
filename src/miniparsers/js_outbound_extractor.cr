@@ -83,7 +83,7 @@ module Noir
           methods << {m[1], s, e}
         end
 
-        body.scan(/\bthis\s*\.\s*(#{VERBS.join("|")})\s*\(\s*(`[^`]*`|'[^']*'|"[^"]*")/) do |call|
+        body.scan(/\bthis\s*\.\s*(#{VERBS.join("|")})(?:<(?:[^<>]|<[^<>]*>)*>)?\s*\(\s*(`[^`]*`|'[^']*'|"[^"]*")/) do |call|
           pos = call.begin.not_nil!
           owner = ""
           methods.each do |name, s, e|
@@ -171,14 +171,25 @@ module Noir
     end
 
     # -- attribution --------------------------------------------------------
+    # Instance map: `connector: new Connector(` across the repo, plus class
+    # import aliases (`import { CreatorsDataSource as ConnectorCreators }`)
+    # so renamed wirings still resolve to the declaring class.
     private def instance_names(sources : Hash(String, String),
                                classes : Array(String)) : Hash(String, Array(String))
       map = {} of String => Array(String)
+      known = classes.dup
+      sources.each_value do |content|
+        content.scan(/([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/) do |m|
+          known << m[2] if classes.includes?(m[1])
+        end
+      end
       classes.each do |cls|
         names = [] of String
         sources.each_value do |content|
-          content.scan(/([A-Za-z_$][\w$]*)\s*[:=]\s*new\s+#{Regex.escape(cls)}\s*\(/) do |m|
-            names << m[1]
+          known.each do |cname|
+            content.scan(/([A-Za-z_$][\w$]*)\s*[:=]\s*new\s+#{Regex.escape(cname)}\s*\(/) do |m|
+              names << m[1]
+            end
           end
         end
         map[cls] = names.uniq unless names.empty?
@@ -200,20 +211,28 @@ module Noir
           return m[1] if m[2] == method
         end
         # 2) arrow property: field: (…) => body — the body spans exactly to
-        # the next arrow property, so a call inside it attributes precisely.
+        # the next arrow property. The receiver may be any property access
+        # (`dataSources.connectorCreators.method(`): import-aliased classes
+        # make a strict alias map unreliable, so match on the method call
+        # shape with any receiver.
         arrows = [] of Tuple(String, Int32)
         content.scan(/([A-Za-z_$][\w$]*)\s*:\s*(?:async\s*)?\(\s*[^)]*\)?\s*=>/) do |m|
           arrows << {m[1], m.begin.not_nil!}
         end
-        aliases.each do |alias_name|
-          needles = ["#{alias_name}.#{method}(", "dataSources.#{alias_name}.#{method}("]
-          arrows.each_with_index do |(field, start), i|
-            span_end = i + 1 < arrows.size ? arrows[i + 1][1] : content.size
-            chunk = content[start...Math.min(span_end, content.size)]
-            needles.each do |needle|
-              return field if chunk.includes?(needle)
-            end
-          end
+        method_needles = aliases.flat_map { |a| ["#{a}.#{method}(", "dataSources.#{a}.#{method}("] }
+        generic_needle = "#{method}("
+        arrows.each_with_index do |(field, start), i|
+          span_end = i + 1 < arrows.size ? arrows[i + 1][1] : content.size
+          chunk = content[start...Math.min(span_end, content.size)]
+          return field if method_needles.any? { |n| chunk.includes?(n) }
+        end
+        # Fallback: any receiver (import-aliased datasources break the alias
+        # map). Last resort — method-name collisions across datasources can
+        # mis-attribute here, so it runs only when the strict pass found nothing.
+        arrows.each_with_index do |(field, start), i|
+          span_end = i + 1 < arrows.size ? arrows[i + 1][1] : content.size
+          chunk = content[start...Math.min(span_end, content.size)]
+          return field if chunk.includes?(generic_needle)
         end
       end
       ""
