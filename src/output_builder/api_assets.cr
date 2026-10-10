@@ -9,6 +9,8 @@ class OutputBuilderApiAssets < OutputBuilder
 
   def print(endpoints : Array(Endpoint), passive_results : Array(PassiveScanResult) = [] of PassiveScanResult)
     http = endpoints.reject(&.non_http?)
+    outbound = http.select { |ep| ep.details.technology == "outbound_call" }
+    http = http.reject { |ep| ep.details.technology == "outbound_call" }
     client_documents = http.select { |ep| ep.details.technology == "graphql_operation" }
     operations = http.select { |ep| graphql_operation?(ep) }
     routes = http.reject { |ep| graphql_operation?(ep) || ep.details.technology == "graphql_operation" }
@@ -35,7 +37,7 @@ class OutputBuilderApiAssets < OutputBuilder
         json.field "capabilities" do
           json.object do
             json.field "inbound_routes", true
-            json.field "outbound_calls", false
+            json.field "outbound_calls", !outbound.empty?
             json.field "deployment_verification", false
             json.field "coverage_proven", false
           end
@@ -64,7 +66,26 @@ class OutputBuilderApiAssets < OutputBuilder
           end
         end
         json.field "outbound_calls" do
-          json.array { }
+          json.array do
+            outbound.each do |ep|
+              ev = ep.details.route_evidence
+              json.object do
+                json.field "source" do
+                  json.object do
+                    json.field "kind", ev.try(&.entrypoint.try &.empty?) == false ? "graphql_operation" : "service"
+                    json.field "ref", ev.try(&.entrypoint) || ""
+                  end
+                end
+                json.field "method", ep.method
+                json.field "url_template", path_for(ep)
+                json.field "url_expression", ep.url.includes?("${") ? ep.url : nil
+                json.field "base_url_config", ev.try(&.mount_expression)
+                json.field "handler", ev.try(&.handler)
+                json.field "evidence" { write_sources(json, ep) }
+                json.field "issues", ev.try(&.issues) || [] of String
+              end
+            end
+          end
         end
         json.field "diagnostics" do
           json.array do
@@ -83,6 +104,7 @@ class OutputBuilderApiAssets < OutputBuilder
           json.object do
             json.field "http_routes", routes.size + transports.size
             json.field "graphql_operations", bound_operations.size
+            json.field "outbound_call_count", outbound.size
             json.field "definition_candidates", definitions.size
             json.field "graphql_client_documents", client_documents.size
             json.field "unknown_registration", unknown

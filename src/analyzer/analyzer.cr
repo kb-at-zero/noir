@@ -172,7 +172,10 @@ def analysis_endpoints(options : Hash(String, YAML::Any), techs, logger : NoirLo
         # Set technology on each endpoint using map to handle struct copy
         endpoints_with_tech = endpoints.map do |ep|
           details = ep.details
-          details.technology = tech
+          # Analyzers may pre-tag an endpoint with a cross-cutting kind
+          # (e.g. `outbound_call` from the datasource extractor) that must
+          # not be overwritten by the analyzer-level tech stamp.
+          details.technology = tech unless details.technology.presence
           ep.details = details
           ep
         end

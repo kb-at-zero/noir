@@ -1,4 +1,5 @@
 require "../../engines/javascript_engine"
+require "../../../miniparsers/js_outbound_extractor"
 require "../../../miniparsers/js_route_extractor"
 require "../../../miniparsers/import_graph"
 require "../../../models/code_locator"
@@ -13,6 +14,31 @@ module Analyzer::Javascript
       result = [] of Endpoint
       static_dirs = [] of Hash(String, String)
       include_callee = callees_needed?
+
+      # Outbound calls from RESTDataSource subclasses: cross-file pass over
+      # every scanned source plus the repo's node-config files.
+      outbound = [] of Endpoint
+      begin
+        outbound_sources = {} of String => String
+        (get_files_by_extension(".js") + get_files_by_extension(".ts")).each do |path|
+          next if path.includes?("/test/") || path.includes?(".test.") || path.includes?(".spec.")
+          content = read_file_content(path)
+          outbound_sources[path] = content if content.includes?("DataSource") ||
+                                             content.includes?("dataSource") ||
+                                             content.includes?("datasource")
+        end
+        unless outbound_sources.empty?
+          config_sources = [] of String
+          ["config/default.js", "config/production.js", "config/default.ts",
+           "config/production.ts", "config/default.json", "config/production.json"].each do |rel|
+            get_files_by_relative_path(rel).each { |f| config_sources << read_file_content(f) }
+          end
+          outbound = Noir::JSOutboundExtractor.extract(outbound_sources, config_sources)
+        end
+      rescue e
+        STDERR.puts "OUTBOUND-FAIL: #{e.message}
+#{e.backtrace?.try(&.first(5).join("\n"))}"
+      end
 
       # koa-router mounts sub-routers through a `.routes()` middleware
       # chain that the Express-oriented mount scanner can't model:
@@ -69,6 +95,8 @@ module Analyzer::Javascript
       # Process static directories to create endpoints for static files
       process_js_static_dirs(static_dirs, result)
 
+      STDERR.puts "OUTBOUND-COUNT: #{outbound.size}"
+      result.concat(outbound)
       result
     end
 
