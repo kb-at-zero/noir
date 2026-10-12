@@ -1,6 +1,7 @@
 require "../../engines/go_engine"
 require "../../../miniparsers/gin_mount_resolver"
 require "../../../miniparsers/apiserver_adapter"
+require "../../../miniparsers/go_outbound_extractor"
 
 module Analyzer::Go
   class Gin < GoEngine
@@ -19,6 +20,17 @@ module Analyzer::Go
       collect_go_modules.each { |mod, dir| modules[dir] = mod }
       hits = Noir::GinMountResolver.new(sources, modules, configured_root_groups).resolve
       hits += Noir::ApiserverAdapter.new(sources, modules).resolve
+      # Go outbound calls (resty / net-http), attributed back to route
+      # handlers through the reverse call graph.
+      route_handlers = hits.map { |h| h.evidence.handler }.reject(&.empty?)
+      outbound = [] of Endpoint
+      begin
+        toml_sources = get_files_by_extension(".toml").map { |p| read_file_content(p) }
+        toml_sources += Dir.glob(File.join(@base_path.to_s, "**", "conf*.toml")).first(50).map { |p| File.read(p) rescue "" }
+        outbound = Noir::GoOutboundExtractor.extract(sources, modules, route_handlers, toml_sources, @base_path.to_s)
+      rescue e
+        logger.debug "go outbound extraction failed: #{e.message}"
+      end
       replacements = Set(Tuple(String, Int32, String)).new
       corrected = [] of Endpoint
       hits.each do |hit|
@@ -40,7 +52,7 @@ module Analyzer::Go
         next if ep.details.code_paths.any? { |cp| replacements.includes?({cp.path, cp.line || 0, ep.method}) }
         corrected << ep
       end
-      @result = corrected
+      @result = corrected + outbound
     end
 
     private def analyze_legacy
