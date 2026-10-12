@@ -992,6 +992,10 @@ module Analyzer::Python
         @params = params
       end
 
+      def name : ::String
+        @name
+      end
+
       def params : Array(FunctionParameter)
         @params
       end

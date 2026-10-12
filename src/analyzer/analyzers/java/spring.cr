@@ -4,6 +4,7 @@ require "../../../miniparsers/java_parameter_extractor_ts"
 require "../../../miniparsers/java_callee_extractor"
 require "../../../utils/spring_property_path"
 require "../../engines/java_engine"
+require "../../../models/route_evidence"
 require "../../../utils/path_scope"
 require "../../../utils/url_path"
 require "../../../utils/top_level_split"
@@ -215,6 +216,16 @@ module Analyzer::Java
 
               line = route.line + 1
               details = Details.new(PathInfo.new(path, line))
+
+              # Handler symbol: `package.Class.method` — lets outbound
+              # attribution and the query layer address this route.
+              unless route.class_name.empty? || route.method_name.empty?
+                ev = RouteEvidence.new
+                ev.handler = "#{route.class_name}.#{route.method_name}"
+                ev.registration_status = "registered"
+                ev.path_resolution = "resolved"
+                details.route_evidence = ev
+              end
 
               endpoint = Endpoint.new(
                 resolve_endpoint_path(Noir::URLPath.join_rooted(base_path, route.path), spring_properties),

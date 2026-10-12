@@ -38,19 +38,76 @@ module Noir
       class_meta = {} of String => ClassMeta
 
       sources.each do |file, content|
-        next unless content.includes?("extends") && content.matches?(DS_SUBCLASS)
-        collect_class_calls(file, content).each do |meta, site|
+        if content.includes?("extends") && content.matches?(DS_SUBCLASS)
+          collect_class_calls(file, content).each do |meta, site|
+            calls << site
+            class_meta[meta.name] = meta
+          end
+        end
+        collect_fetch_di_calls(file, content).each do |meta, site|
           calls << site
           class_meta[meta.name] = meta
         end
       end
+      # Plain HTTP clients: axios.get('u'), got.post('u'), fetch('u', {method}),
+      # plus instance calls (api.get where api = axios.create/got.extend).
+      plain_instances = {} of String => String   # var => 'axios'|'got'
+      sources.each_value do |content|
+        content.scan(/([A-Za-z_$][\w$]*)\s*=\s*(axios|got)\s*\.(?:create|extend)\s*\(/) do |m|
+          plain_instances[m[1]] = m[2]
+        end
+      end
+      sources.each do |file, content|
+        next unless content.matches?(/\b(fetch|axios|got)\s*[.(]/)
+        verb_re = VERBS.join("|")
+        # axios.get('u') / api.get('u') / got.post('u')
+        content.scan(/(?:\baxios|\bgot|#{plain_instances.keys.map { |k| Regex.escape(k) }.join("|")})\s*\.\s*(#{verb_re})\s*(?:<[^>]*>)?\s*\(\s*(`[^`]*`|'[^']*'|"[^"]*")/) do |call|
+          url_raw = call[2]? || ""
+          url = url_raw.size >= 2 ? url_raw[1..-2] : ""
+          next if url.empty? || url.starts_with?("http://localhost")
+          dynamic = url.includes?("${")
+          line = content[0, call.begin.not_nil!].count('\n') + 1
+          calls << CallSite.new("", "", call[1].upcase, url, dynamic, file, line)
+        end
+        # fetch('u', { method: 'POST' }) — default GET
+        content.scan(/\bfetch\s*\(\s*(`[^`]*`|'[^']*'|"[^"]*")\s*,?\s*\{?\s*(?:method\s*:\s*['"](\w+)['"])?/) do |call|
+          url_raw = call[1]? || ""
+          url = url_raw.size >= 2 ? url_raw[1..-2] : ""
+          next if url.empty? || url.starts_with?("http://localhost")
+          verb = (call[2]? || "GET").upcase
+          verb = "GET" unless VERBS.includes?(verb.downcase)
+          line = content[0, call.begin.not_nil!].count('\n') + 1
+          calls << CallSite.new("", "", verb, url, url.includes?("${"), file, line)
+        end
+      end
       return [] of Endpoint if calls.empty?
 
+      # NestJS Fetch.register apiHost -> base url map (repo-wide scan)
+      di_base = {} of String => String
+      sources.each_value do |content|
+        content.scan(/provide\s*:\s*[\w.]*FETCH_PROVIDE[\w.]*([A-Z_0-9]+)[\w.]*\s*,\s*apiHost\s*:\s*['"]([\w-]+)['"]/) do |m|
+          base = fetch_di_base(config_sources, m[2])
+          di_base[m[1]] = base unless base.empty?
+        end
+      end
+      # datasource file @Inject(FETCH_PROVIDE.X) -> key -> base
+      provide_key_of = {} of String => String
+      sources.each do |file, content|
+        next unless content.includes?("@Inject(")
+        content.scan(/@Inject\s*\(\s*[\w.]*FETCH_PROVIDE[\w.]*([A-Z_0-9]+)[\w.]*\s*\)/) do |m|
+          cls_m = content.match(/class\s+([A-Za-z_$][\w$]*)/)
+          provide_key_of[file + ":" + cls_m.try(&.[1]).to_s] = m[1] if cls_m
+        end
+      end
       instances = instance_names(sources, class_meta.keys)
       endpoints = [] of Endpoint
       calls.each do |site|
         meta = class_meta[site.datasource]? || ClassMeta.new(site.datasource, "", "")
         base = config_value(config_sources, meta.prefix_key)
+        if base.empty? && meta.prefix_key.empty?
+          key = provide_key_of[site.file + ":" + site.datasource]?
+          base = key ? (di_base[key]? || "") : ""
+        end
         url, dynamic = compose_url(base, meta.api_version, site)
         field = attribute(sources, instances, site)
         endpoints << build_endpoint(site, url, dynamic, field, meta.prefix_key, base)
@@ -136,6 +193,57 @@ module Noir
         result = child if result.nil?
       end
       result
+    end
+
+    # -- NestJS Fetch DI ----------------------------------------------------
+    # class FooApi { constructor(@Inject(KEY) private x: Fetch) {} m() { this.x.get('/p', ...) } }
+    # Module: Fetch.register({ provide: KEY, apiHost: 'host_key' })
+    # Config: api: { host_key: { url: 'http://...' } }
+    private def collect_fetch_di_calls(file : String, content : String)
+      found = [] of Tuple(ClassMeta, CallSite)
+      return found unless content.includes?("@Inject(") && content.includes?(": Fetch")
+      content.scan(/class\s+([A-Za-z_$][\w$]*)[^{]*\{/) do |cm|
+        cls = cm[1]
+        open_idx = cm.end.not_nil! - 1
+        close_idx = JSLiteralScanner.find_matching_brace(content, open_idx)
+        next unless close_idx
+        body = content[open_idx + 1...close_idx]
+        fields = [] of String
+        body.scan(/@Inject\s*\(\s*[\w.]+\s*\)\s*(?:private|public|protected|readonly)?\s*([A-Za-z_$][\w$]*)\s*:\s*Fetch/) do |im|
+          fields << im[1]
+        end
+        next if fields.empty?
+        verb_re = VERBS.join("|")
+        fields.each do |fname|
+          body.scan(/this\s*\.\s*#{Regex.escape(fname)}\s*\.\s*(#{verb_re})\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*\(\s*(`[^`]*`|'[^']*'|"[^"]*")/) do |call|
+            url_raw = call[2]? || ""
+            url = url_raw.size >= 2 ? url_raw[1..-2] : ""
+            dynamic = url.includes?("${") || url.empty?
+            method_n = enclosing_ts_method(body, call.begin.not_nil!)
+            line = content[0, cm.begin.not_nil! + 1 + call.begin.not_nil!].count('\n') + 1
+            found << {ClassMeta.new(cls, "", ""), CallSite.new(cls, method_n, call[1].upcase, url, dynamic, file, line)}
+          end
+        end
+      end
+      found
+    end
+
+    private def enclosing_ts_method(body : String, offset : Int32) : String
+      best = ""
+      body.scan(/(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::[^{]+)?\{/) do |m|
+        best = m[1] if (m.begin.not_nil! <= offset)
+      end
+      best
+    end
+
+    # apiHost key -> config url (api.<host>.url), config files only.
+    private def fetch_di_base(config_sources : Array(String), api_host : String) : String
+      config_sources.each do |cs|
+        if m = cs.match(/#{Regex.escape(api_host)}\s*:\s*\{[^}]*?url\s*:\s*['"`]([^'"`]+)['"`]/m)
+          return m[1]
+        end
+      end
+      ""
     end
 
     # -- config + URL composition ------------------------------------------

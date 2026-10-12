@@ -1,4 +1,5 @@
 require "../../engines/python_engine"
+require "../../../models/route_evidence"
 require "../../../utils/top_level_split"
 require "./python_helper"
 
@@ -268,6 +269,16 @@ module Analyzer::Python
                 emit_methods = declared_methods.empty? ? [http_method_name] : declared_methods
 
                 details = Details.new(PathInfo.new(path, index + 1))
+                # Handler function name from the `def` under the decorator:
+                # fills evidence.handler so outbound attribution and the
+                # query layer can address this route precisely.
+                if fn_def = parse_function_def(codelines, def_line)
+                  ev = RouteEvidence.new
+                  ev.handler = fn_def.name.presence.to_s
+                  ev.registration_status = "registered"
+                  ev.path_resolution = "resolved"
+                  details.route_evidence = ev
+                end
                 full_path = normalize_fastapi_path_params(router_class.join(http_route_path))
                 base_endpoint = Endpoint.new(full_path, emit_methods.first, params, details)
                 base_endpoint.protocol = "ws" if websocket_route

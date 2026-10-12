@@ -27,9 +27,59 @@ module Noir
     # symbol(dir-prefixed) => {file, start_row, end_row}
     alias FnTable = Hash(String, Tuple(String, Int32, Int32))
 
+    # Blanks comments and string/rune CONTENTS with spaces (quotes kept),
+    # preserving byte offsets so scanning is offset/line-stable while
+    # literals stay readable via spans into the original source.
+    def self.sanitize_for_scan(source : String) : String
+      chars = source.chars
+      i = 0
+      n = chars.size
+      while i < n
+        c = chars[i]
+        if c == '/' && chars[i + 1]? == '/'
+          while i < n && chars[i] != '\n'
+            chars[i] = ' ' unless chars[i] == '\n'
+            i += 1
+          end
+        elsif c == '/' && chars[i + 1]? == '*'
+          chars[i] = ' '
+          chars[i + 1] = ' ' if chars[i + 1]?
+          i += 2
+          while i < n && !(chars[i] == '*' && chars[i + 1]? == '/')
+            chars[i] = ' ' unless chars[i] == '\n'
+            i += 1
+          end
+          chars[i] = ' ' if i < n
+          chars[i + 1] = ' ' if chars[i + 1]? && i + 1 < n
+          i += 2 if i < n
+        elsif c == '"' || c == '`'
+          quote = c
+          i += 1
+          while i < n && chars[i] != quote
+            if chars[i] == '\\' && chars[i + 1]?
+              chars[i] = ' '
+              i += 1
+              chars[i] = ' ' unless chars[i] == '\n'
+            else
+              chars[i] = ' ' unless chars[i] == '\n'
+            end
+            i += 1
+          end
+          i += 1 # skip the closing quote — re-processing it would reopen
+        elsif c == '\'' && chars[i + 1]? && chars[i + 2]? == '\''
+          chars[i + 1] = ' ' unless chars[i + 1] == '\n'
+          i += 3
+        else
+          i += 1
+        end
+      end
+      chars.join
+    end
+
     def extract(sources : Hash(String, String), module_paths : Hash(String, String),
                 route_handlers : Array(String), toml_sources : Array(String) = [] of String,
-                base_path : String = "") : Array(Endpoint)
+                base_path : String = "",
+                route_sites : Array(Tuple(String, Int32, String)) = [] of Tuple(String, Int32, String)) : Array(Endpoint)
       imports = {} of String => Hash(String, String)
       fns = FnTable.new
       consts = {} of String => String             # "dir::name" => literal
@@ -53,7 +103,47 @@ module Noir
         index_callers(file, source, imports[file], fns, struct_fields, callers, module_paths, interfaces)
       end
 
+      index_closure_callers(sources, route_sites, fns, callers)
+      # Route evidence carries code-level short names
+      # (`pkg_alias.Method`); fn symbols are `dir::Type.Method`. Resolve
+      # via import aliases (aliased imports rename the dir) and directory
+      # basenames so the reverse walk can land on real handler symbols.
+      alias_dirs = {} of String => Set(String)
+      sources.each do |file, source|
+        imports[file]?.try &.each do |alias_name, import_path|
+          next if {"_", "."}.includes?(alias_name)
+          d = pkg_dir(import_path, module_paths) || import_path
+          (alias_dirs[alias_name] ||= Set(String).new) << d
+          (alias_dirs[import_path.split('/').last] ||= Set(String).new) << d
+        end
+      end
       handler_set = route_handlers.to_set
+      route_handlers.each do |short|
+        next if short.starts_with?("inline@")
+        pkg, _, mname = short.rpartition('.')
+        next if pkg.empty?
+        # Local-var conventions: trackingHandler / trackingService point at
+        # the `tracking` package's types. Strip common suffixes.
+        candidates = Set(String).new
+        {pkg, pkg.rchop("Handler"), pkg.rchop("Service"), pkg.rchop("Domain"),
+         pkg.rchop("_handler"), pkg.rchop("_service")}.each do |c|
+          candidates << c unless c.empty?
+        end
+        dirs = Set(String).new
+        candidates.each { |c| alias_dirs[c]?.try &.each { |d| dirs << d } }
+        # Handler-looking dirs only: local vars named xxxHandler may point
+        # at service/domain packages with identical basenames.
+        handler_dirs = dirs.select { |d| d.includes?("handler") }
+        dirs = handler_dirs unless handler_dirs.empty?
+        fns.each_key do |sym|
+          dir, _, rest = sym.rpartition("::")
+          next if dir.empty?
+          method = rest.includes?('.') ? rest.split('.').last : rest
+          next unless method == mname
+          next unless (candidates.includes?(File.basename(dir)) && dir.includes?("handler")) || dirs.includes?(dir)
+          handler_set << sym
+        end
+      end
       sites = [] of CallSite
       sources.each do |file, source|
         next unless needs_scan?(source)
@@ -66,7 +156,8 @@ module Noir
         base = resolve_base(sources, imports, struct_fields, toml, site.func,
                             module_paths)
         url = base.empty? ? site.url : join_url(base, site.url)
-        owner = attribute_up(callers, handler_set, site.func, 5)
+        owner = attribute_up(callers, handler_set, site.func, 12)
+        owner = attribute_inline(route_sites, site) if owner.empty?
         owner = owner.lchop("#{base_path}/") unless owner.empty? || base_path.empty?
         endpoints << build(site, url, owner, base)
       end
@@ -253,7 +344,14 @@ module Noir
               next unless field && operand
               mname = TS.node_text(field, source)
               otext = TS.node_text(operand, source)
-              if otext.includes?('.')
+              if otext.includes?('(')
+                # Chained call (pkg.GetService().M(...)): resolve by method
+                # name only — imprecise but the bounded walk to a handler
+                # keeps false positives out of the final attribution.
+                fns.each_key do |sym|
+                  callers[sym] << caller if sym.ends_with?(".#{mname}") || sym.ends_with?("::#{mname}")
+                end
+              elsif otext.includes?('.')
                 qualifier, sel = otext.split('.', 2)
                 if imported = imports[qualifier]?
                   target = "#{pkg_dir(imported, module_paths) || imported}::#{mname}"
@@ -273,7 +371,7 @@ module Noir
                       # interface field or unresolvable namespace: loose
                       # method-name edges, scoped later by handler reach.
                       fns.each_key do |sym|
-                        callers[sym] << caller if sym.ends_with?(".#{mname}")
+                        callers[sym] << caller if sym.ends_with?(".#{mname}") || sym.ends_with?("::#{mname}")
                       end
                     end
                   end
@@ -285,7 +383,7 @@ module Noir
               else
                 # bare identifier receiver: loose method-name edges
                 fns.each_key do |sym|
-                  callers[sym] << caller if sym.ends_with?(".#{mname}")
+                  callers[sym] << caller if sym.ends_with?(".#{mname}") || sym.ends_with?("::#{mname}")
                 end
               end
             end
@@ -317,37 +415,132 @@ module Noir
     end
 
     # -- client call sites ---------------------------------------------------
+    # Scans the SANITIZED source (comments and string contents blanked,
+    # offsets preserved) so the verb regex and the arg scanner never see
+    # comment text or string noise; literals are read back from the
+    # original source via the identical offsets.
     private def collect_call_sites(file : String, source : String,
                                    imports : Hash(String, String),
                                    consts : Hash(String, String), sites : Array(CallSite))
       dir = File.dirname(file)
-      # Verb-first matching: a `.Post(path)` whose enclosing statement chain
-      # contains a resty `.R()` builder (lookback window), or a direct
-      # `client.Post(path)`. Robust to nested parens in middleware calls.
-      source.scan(/\.\s*(#{VERBS.join("|")})\s*\(\s*([A-Za-z_][\w.]*)\s*\)/) do |m|
+      san = GoOutboundExtractor.sanitize_for_scan(source)
+
+      san.scan(/\.\s*(#{VERBS.join("|")})\s*\(/) do |m|
         start = m.begin.not_nil!
-        lookback = source[{start - 220, 0}.max, 220]? || ""
+        lookback = san[{start - 260, 0}.max, 260]? || ""
         next unless lookback.includes?(".R()") || lookback.includes?("restyClient.") ||
-                    lookback.includes?("client.")
-        url, dynamic = url_of(m[2], dir, consts, source)
+                    lookback.includes?("client.") || lookback.includes?(".WithContext(") ||
+                    lookback.matches?(/resty|lient|fetch|tpCli|apiCli/i)
+        span = first_arg_span(san, m.end.not_nil! - 1)
+        next unless span
+        arg0 = source[span]? || ""
+        next if arg0.empty?
+        url, dynamic = classify_arg(arg0, dir, consts, source)
         sites << CallSite.new(enclosing_fn(file, source, start), m[1].upcase,
           url, dynamic, file, line_of(source, start))
       end
-      # net/http shortcuts: http.Get/Post(url)
       if imports.values.any? { |v| v == "net/http" }
-        source.scan(/\bhttp\s*\.\s*(Get|Post|Head)\s*\(\s*([A-Za-z_][\w.]*)\s*[,)]/) do |m|
-          url, dynamic = url_of(m[2], dir, consts, source)
+        san.scan(/\bhttp\s*\.\s*(Get|Post|Head)\s*\(/) do |m|
+          span = first_arg_span(san, m.end.not_nil! - 1)
+          next unless span
+          arg0 = source[span]? || ""
+          next if arg0.empty?
+          url, dynamic = classify_arg(arg0, dir, consts, source)
           sites << CallSite.new(enclosing_fn(file, source, m.begin.not_nil!), m[1].upcase,
             url, dynamic, file, line_of(source, m.begin.not_nil!))
         end
-        source.scan(/\bhttp\s*\.\s*NewRequest\s*\(\s*([A-Za-z_][\w.]*)\s*,\s*([A-Za-z_][\w.]*)\s*,/) do |m|
-          url, dynamic = url_of(m[2], dir, consts, source)
-          verb = VERBS.includes?(m[1]) ? m[1].upcase : "GET"
+        san.scan(/\bhttp\s*\.\s*NewRequest\s*\(/) do |m|
+          args = split_args(san, m.end.not_nil! - 1)
+          next unless args.size >= 2
+          verb_arg = source[args[0]]? || ""
+          url_arg = source[args[1]]? || ""
+          next if url_arg.empty?
+          verb = VERBS.includes?(verb_arg) ? verb_arg.upcase : "GET"
+          url, dynamic = classify_arg(url_arg, dir, consts, source)
           sites << CallSite.new(enclosing_fn(file, source, m.begin.not_nil!), verb,
             url, dynamic, file, line_of(source, m.begin.not_nil!))
         end
       end
       sites.uniq! { |s| {s.file, s.line, s.verb} }
+    end
+
+    # First-argument byte span of the call whose '(' sits at open_paren.
+    # Runs on sanitized text: no strings/comments to trip the state machine.
+    private def first_arg_span(san : String, open_paren : Int32) : Range(Int32, Int32)?
+      i = open_paren + 1
+      depth = 0
+      start = i
+      while i < san.size
+        case san[i]
+        when '('
+          depth += 1
+        when ')'
+          return (start...i) if depth == 0
+          depth -= 1
+        when ','
+          return (start...i) if depth == 0
+        end
+        i += 1
+      end
+      nil
+    end
+
+    # All top-level argument spans of a call (used by NewRequest).
+    private def split_args(san : String, open_paren : Int32) : Array(Range(Int32, Int32))
+      spans = [] of Range(Int32, Int32)
+      i = open_paren + 1
+      depth = 0
+      start = i
+      while i < san.size
+        case san[i]
+        when '('
+          depth += 1
+        when ')'
+          if depth == 0
+            spans << (start...i)
+            return spans
+          end
+          depth -= 1
+        when ','
+          if depth == 0
+            spans << (start...i)
+            start = i + 1
+          end
+        end
+        i += 1
+      end
+      spans
+    end
+
+    # Classifies a first-argument text: Sprintf format -> static prefix,
+    # literal, ident+"suffix", call expression -> literal prefix or token,
+    # bare ident -> variable tracking in the source.
+    private def classify_arg(arg : String, dir : String,
+                             consts : Hash(String, String), source : String) : Tuple(String, Bool)
+      if arg.starts_with?('"')
+        return {arg[1..-2]? || "", false}
+      end
+      if m = arg.match(/\Afmt\.Sprintf\(\s*"([^"]*)"/)
+        prefix = m[1].split('%').first
+        # Empty prefix ("%s/v1/x"): keep the full format string as the
+        # template — the optimizer drops empty-URL endpoints, and the
+        # format still carries the path shape for suffix resolution.
+        prefix = m[1] if prefix.empty?
+        return {prefix, true}
+      end
+      if m = arg.match(/\A[A-Za-z_][\w.]*\s*\+\s*"([^"]*)"\z/)
+        return {m[1], true}
+      end
+      if arg.includes?('(')
+        lit = arg.match(/"([^"]*)"/).try(&.[1])
+        if lit
+          prefix = lit.split('%').first
+          prefix = lit if prefix.empty?
+          return {prefix, lit.includes?('%')}
+        end
+        return {arg.split(/[\s(]/).first?.to_s, true}
+      end
+      url_of(arg, dir, consts, source)
     end
 
     private def url_of(expr : String, dir : String, consts : Hash(String, String),
@@ -358,12 +551,19 @@ module Noir
       if (v = consts["#{dir}::#{expr}"]?)
         return {v, false}
       end
-      if source.includes?("fmt.Sprintf(#{expr}") ||
-         source.includes?("#{expr} = fmt.Sprintf")
-        # static prefix up to the first % verb, if the format is a literal
-        if m = source.match(/fmt\.Sprintf\(\s*"([^"]*)"[^)]*#{Regex.escape(expr)}/)
-          return {m[1].split('%').first, true}
-        end
+      if m = source.match(/#{Regex.escape(expr)}\s*:?=[^=]{0,120}?fmt\.Sprintf\(\s*"([^"]*)"/m)
+        prefix = m[1].split('%').first
+        prefix = m[1] if prefix.empty?
+        return {prefix, m[1].includes?('%')}
+      end
+      if m = source.match(/#{Regex.escape(expr)}\s*:?=[^=\n]{0,80}"([^"\n]*)"/)
+        return {m[1], false}
+      end
+      if m = source.match(/#{Regex.escape(expr)}\s*:?=[^=\n]{0,80}\w+\s*\+\s*"([^"\n]*)"/)
+        return {m[1], false}
+      end
+      if m = source.match(/fmt\.Sprintf\(\s*"([^"]*)"[^)]*#{Regex.escape(expr)}/)
+        return {m[1].split('%').first, true}
       end
       {expr, true}
     end
@@ -437,6 +637,49 @@ module Noir
       section = parts[-2]
       key = parts[-1]
       toml["#{section}.#{key}"]? || toml["#{parts[-3]}.#{section}.#{key}"]?
+    end
+
+    # Closure attribution: the call site's nearest preceding inline-handler
+    # registration in the same file owns the closure body.
+    private def attribute_inline(route_sites : Array(Tuple(String, Int32, String)),
+                                 site : CallSite) : String
+      best = ""
+      best_line = -1
+      route_sites.each do |file, line, handler|
+        next unless file == site.file && handler.starts_with?("inline@")
+        if line <= site.line && site.line - line <= 200 && line >= best_line
+          best = handler
+          best_line = line
+        end
+      end
+      best
+    end
+
+    # For each inline route registration, the source between its line and
+    # the next registration is the closure body: its `x.Method(` calls make
+    # the inline@ symbol a CALLER of those methods, closing the reverse
+    # attribution path handler-closure -> domain -> outbound call.
+    private def index_closure_callers(sources : Hash(String, String),
+                                      route_sites : Array(Tuple(String, Int32, String)),
+                                      fns : FnTable,
+                                      callers : Hash(String, Array(String)))
+      by_file = route_sites.select { |_, _, h| h.starts_with?("inline@") }
+                           .sort_by { |_, line, _| line }
+                           .group_by { |file, _, _| file }
+      by_file.each do |file, sites|
+        source = sources[file]? || next
+        lines = source.split("\n")
+        sites.each_with_index do |(_, line, handler), i|
+          span_end = i + 1 < sites.size ? sites[i + 1][1] - 1 : {line + 60, lines.size}.min
+          body = lines[line...{span_end, lines.size}.min]?.try(&.join("\n")) || next
+          body.scan(/\b[A-Za-z_][\w.]*\.([A-Z][A-Za-z_]*)\s*\(/) do |m|
+            mname = m[1]
+            fns.each_key do |sym|
+              callers[sym] << handler if sym.ends_with?(".#{mname}")
+            end
+          end
+        end
+      end
     end
 
     # -- attribution ------------------------------------------------------------

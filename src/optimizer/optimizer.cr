@@ -189,6 +189,10 @@ class EndpointOptimizer
       tiny_tmp.url = normalize_url_shape(tiny_tmp.url) unless tiny_tmp.non_http?
       dedup_url = tiny_tmp.non_http? ? tiny_tmp.url : normalize_url_shape(tiny_tmp.url, collection_endpoint?(tiny_tmp))
 
+      # Outbound calls are call-site records, not addressable endpoints:
+      # same (method, template) from different handlers/sites are distinct
+      # edges. Disambiguate the dedup key with the evidence location.
+      dedup_url = "#{dedup_url} @#{tiny_tmp.details.code_paths.first?.try(&.path)}:#{tiny_tmp.details.code_paths.first?.try(&.line)}" if tiny_tmp.details.technology == "outbound_call"
       key = {tiny_tmp.method, dedup_url, endpoint_source_scope(tiny_tmp, cross_tech_keys)}
 
       if final_map.has_key?(key)

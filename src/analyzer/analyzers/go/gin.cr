@@ -28,7 +28,7 @@ module Analyzer::Go
       begin
         toml_sources = get_files_by_extension(".toml").map { |p| read_file_content(p) }
         toml_sources += Dir.glob(File.join(@base_path.to_s, "**", "conf*.toml")).first(50).map { |p| File.read(p) rescue "" }
-        outbound = Noir::GoOutboundExtractor.extract(sources, modules, route_handlers, toml_sources, @base_path.to_s)
+        outbound = Noir::GoOutboundExtractor.extract(sources, modules, route_handlers, toml_sources, @base_path.to_s, route_sites)
       rescue e
         logger.debug "go outbound extraction failed: #{e.message}"
       end
