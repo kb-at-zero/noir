@@ -1,4 +1,5 @@
 require "../../engines/python_engine"
+require "../../../miniparsers/python_outbound_extractor"
 require "../../../models/route_evidence"
 require "../../../utils/top_level_split"
 require "./python_helper"
@@ -371,6 +372,25 @@ module Analyzer::Python
         end
       end
       Fiber.yield
+
+
+      # Python outbound (httpx/requests) with reverse attribution to the
+      # route handler defs extracted above.
+      begin
+        py_sources = {} of String => String
+        get_files_by_extension(".py").each do |path|
+          next if path.includes?("/test") || path.includes?("_test") || path.includes?("/tests/")
+          content = read_file_content(path)
+          py_sources[path] = content if content.includes?("httpx") || content.includes?("requests")
+        end
+        py_handlers = result.compact_map do |ep|
+          ep.details.route_evidence.try(&.handler).presence
+        end
+        py_out = Noir::PythonOutboundExtractor.extract(py_sources, py_handlers)
+        result.concat(py_out)
+      rescue e
+        logger.debug "python outbound extraction failed: #{e.message}"
+      end
 
       result
     end
