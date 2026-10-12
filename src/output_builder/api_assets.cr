@@ -59,6 +59,16 @@ class OutputBuilderApiAssets < OutputBuilder
             client_documents.each do |ep|
               json.object do
                 json.field "kind", "graphql_client_document"
+                # Fragment `#type.OperationName:firstField` from named client
+                # documents — feeds the query layer's operationName alias.
+                if ep.url.includes?('#') && ep.url.includes?(':')
+                  head, frag = ep.url.split('#', 2)
+                  op_type, rest = frag.split('.', 2)
+                  op_name, field = rest.split(':', 2)
+                  json.field "operation_type", op_type
+                  json.field "operation_name", op_name
+                  json.field "field", field
+                end
                 json.field "sources" { write_sources(json, ep) }
                 json.field "issues", ["client_document_not_server_registration"]
               end

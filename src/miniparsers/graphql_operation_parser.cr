@@ -24,8 +24,8 @@ module Noir
 
     def parse_content(path : String, file_content : String) : Array(Endpoint)
       results = [] of Endpoint
-      each_operation(file_content) do |keyword, name, line|
-        results << build_endpoint(path, keyword, name, line)
+      each_operation(file_content) do |keyword, name, line, first_field|
+        results << build_endpoint(path, keyword, name, line, first_field)
       end
       results
     end
@@ -33,13 +33,13 @@ module Noir
     # True as soon as one named top-level operation is found. Same walk as
     # `parse_content`, without building any endpoint.
     def operation_document?(file_content : String) : Bool
-      each_operation(file_content) { return true }
+      each_operation(file_content) { |k, n2, l, f| return true }
       false
     end
 
     # Yields `{keyword, operation_name, line}` for every named top-level
     # operation definition in `file_content`.
-    private def each_operation(file_content : String, & : String, String, Int32 -> _) : Nil
+    private def each_operation(file_content : String, & : String, String, Int32, String -> _) : Nil
       # Materialize into an Array(Char) for O(1) positional access. Indexing a
       # String is O(n) when it is not single-byte-optimizable, so a single
       # multi-byte char (an emoji in a description, say) would otherwise make
@@ -80,7 +80,8 @@ module Noir
           if depth == 0 && (i == 0 || !ident_char?(chars[i - 1])) && (keyword = keyword_at(chars, i, n))
             new_i, new_line, op_name = read_operation_name(chars, i + keyword.size, n, line)
             if op_name
-              yield keyword, op_name, line
+              first_field = read_first_selection_field(chars, new_i, n)
+              yield keyword, op_name, line, first_field
               line = new_line
               i = new_i
               next
@@ -122,14 +123,68 @@ module Noir
       {name_end, cur_line, name}
     end
 
-    private def build_endpoint(path : String, operation_type : String, operation_name : String, line : Int32) : Endpoint
+    private def build_endpoint(path : String, operation_type : String, operation_name : String,
+                              line : Int32, first_field : String = "") : Endpoint
       param_value_json = {operation_type => operation_name}.to_json
       param_name = "graphql_operation_#{operation_type}_#{operation_name}"
       param = Param.new(param_name, param_value_json, "json")
       details = Details.new(PathInfo.new(path, line))
-      endpoint = Endpoint.new(DEFAULT_GRAPHQL_PATH, "POST", details)
+      # Named client documents carry the declared operation name plus the
+      # first selection field in the URL fragment — unique per operation so
+      # the optimizer keeps them apart, and query layers can build an
+      # operationName -> schema-field alias index.
+      url = first_field.empty? ? DEFAULT_GRAPHQL_PATH
+                             : "#{DEFAULT_GRAPHQL_PATH}##{operation_type}.#{operation_name}:#{first_field}"
+      endpoint = Endpoint.new(url, "POST", details)
       endpoint.push_param(param)
       endpoint
+    end
+
+    # Reads the first selection-field name inside the operation body: skips
+    # the variable list and directives, then takes the identifier after '{'.
+    private def read_first_selection_field(chars : Array(Char), pos : Int32, n : Int32) : String
+      i = pos
+      depth = 0
+      while i < n
+        c = chars[i]
+        if c == '(' && depth == 0
+          # skip variable list
+          vd = 1
+          i += 1
+          while i < n && vd > 0
+            vd += 1 if chars[i] == '('
+            vd -= 1 if chars[i] == ')'
+            i += 1
+          end
+        elsif c == '@' && depth == 0
+          # skip directive
+          i += 1
+          while i < n && chars[i] != '{' && chars[i] != '\n'
+            i += 1
+          end
+        elsif c == '{'
+          depth += 1
+          if depth == 1
+            j = i + 1
+            while j < n && chars[j].whitespace?
+              j += 1
+            end
+            start = j
+            while j < n && ident_char?(chars[j])
+              j += 1
+            end
+            return chars[start...j].join if j > start
+          end
+          i += 1
+        elsif c == '}'
+          depth -= 1
+          return "" if depth < 0
+          i += 1
+        else
+          i += 1
+        end
+      end
+      ""
     end
 
     # Skips a `"..."` or `"""..."""` literal starting at `chars[i] == '"'`.
