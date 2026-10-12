@@ -427,7 +427,10 @@ module Noir
         verb = vn ? (literal_path(vn, source) || "UNKNOWN") : "UNKNOWN"
       end
       handler = TS.node_text(args.last, source)
-      handler = "inline" unless handler.matches?(/\A[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\z/)
+      # Inline closures get a file:line-unique symbol so downstream
+      # outbound attribution can bind calls inside the closure to this
+      # exact route (a bare "inline" matches every closure in the repo).
+      handler = "inline@#{scope.file}:#{TS.node_start_row(node) + 1}" unless handler.matches?(/\A[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\z/)
       if !scope.receiver_name.empty? && handler.starts_with?(scope.receiver_name + ".")
         handler = "#{scope.receiver}.#{handler.lchop(scope.receiver_name + ".")}"
       end

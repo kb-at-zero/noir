@@ -23,6 +23,7 @@ module Analyzer::Go
       # Go outbound calls (resty / net-http), attributed back to route
       # handlers through the reverse call graph.
       route_handlers = hits.map { |h| h.evidence.handler }.reject(&.empty?)
+      route_sites = hits.map { |h| {h.file, h.route.line + 1, h.evidence.handler} }
       outbound = [] of Endpoint
       begin
         toml_sources = get_files_by_extension(".toml").map { |p| read_file_content(p) }
